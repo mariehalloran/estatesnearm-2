@@ -1,0 +1,34 @@
+version: 1
+# ─────────────────────────────────────────────────────────────────────────────
+# AWS Amplify Build Specification — EstatesNearMe
+# Amplify reads this file from the repo root automatically.
+# Environment variables are injected from the Amplify Console / CloudFormation.
+# ─────────────────────────────────────────────────────────────────────────────
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - echo "Node $(node -v) / npm $(npm -v)"
+        - cd frontend
+        - npm ci --prefer-offline
+
+    build:
+      commands:
+        - echo "Building for environment $NODE_ENV"
+        - echo "API URL = $REACT_APP_API_URL"
+        - npm run build
+
+    postBuild:
+      commands:
+        - echo "Build complete. Artifact size:"
+        - du -sh build/
+
+  artifacts:
+    # Tell Amplify where the built static files live relative to the repo root
+    baseDirectory: frontend/build
+    files:
+      - '**/*'
+
+  cache:
+    paths:
+      - frontend/node_modules/**/*

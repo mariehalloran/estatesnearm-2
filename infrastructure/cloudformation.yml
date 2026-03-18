@@ -1,0 +1,855 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EstatesNearMe v3 — DynamoDB, Cognito, API Gateway + WAF, Amplify Hosting,
+  ACM Certificate, Route 53, S3 uploads, Lambda backend.
+  Frontend served via AWS Amplify at findingestates.com.
+  API served via API Gateway at api.findingestates.com.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the backend Lambda deployment zip
+
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key for the backend Lambda deployment zip (e.g. backend/lambda.zip)
+
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: JWT secret used in dev/staging (Cognito used in production)
+
+  GoogleMapsApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Google Maps JavaScript API key
+
+  AdminEmail:
+    Type: String
+    Description: Email for CloudWatch alarms and Cognito admin
+
+  # ── Domain ──────────────────────────────────────────────────────────────────
+  RootDomain:
+    Type: String
+    Default: findingestates.com
+    Description: Root domain registered in Route 53 (e.g. findingestates.com)
+
+  Route53HostedZoneId:
+    Type: String
+    Description: >
+      Route 53 Hosted Zone ID for findingestates.com.
+      Find it in the Route 53 console under Hosted Zones.
+      Looks like: Z1D633PJN98FT9
+
+  GitHubRepoUrl:
+    Type: String
+    Description: >
+      HTTPS URL of your GitHub repo for Amplify to pull from.
+      Example: https://github.com/your-org/estatesnearm
+    Default: https://github.com/YOUR_ORG/estatesnearm
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Git branch Amplify will deploy from
+
+  AmplifyGitHubToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      GitHub Personal Access Token (classic) with repo scope.
+      Amplify uses this to pull your repo. Create at:
+      https://github.com/settings/tokens
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONDITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  ##############################################################################
+  # ACM CERTIFICATE  (must be in us-east-1 for CloudFront/Amplify)
+  # NOTE: If deploying this stack in a region other than us-east-1, the
+  # certificate for CloudFront must still be created in us-east-1.
+  # Amplify will also use this certificate.
+  ##############################################################################
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref RootDomain
+      SubjectAlternativeNames:
+        - !Sub 'www.${RootDomain}'
+        - !Sub 'api.${RootDomain}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref RootDomain
+          HostedZoneId: !Ref Route53HostedZoneId
+        - DomainName: !Sub 'www.${RootDomain}'
+          HostedZoneId: !Ref Route53HostedZoneId
+        - DomainName: !Sub 'api.${RootDomain}'
+          HostedZoneId: !Ref Route53HostedZoneId
+      Tags:
+        - {Key: Project, Value: EstatesNearMe}
+        - {Key: Environment, Value: !Ref Environment}
+
+  ##############################################################################
+  # DYNAMODB TABLES
+  ##############################################################################
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub 'enm-users-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - {AttributeName: userId,     AttributeType: S}
+        - {AttributeName: email,      AttributeType: S}
+        - {AttributeName: cognitoSub, AttributeType: S}
+      KeySchema:
+        - {AttributeName: userId, KeyType: HASH}
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema: [{AttributeName: email, KeyType: HASH}]
+          Projection: {ProjectionType: ALL}
+        - IndexName: cognitoSub-index
+          KeySchema: [{AttributeName: cognitoSub, KeyType: HASH}]
+          Projection: {ProjectionType: ALL}
+      Tags:
+        - {Key: Project, Value: EstatesNearMe}
+        - {Key: Environment, Value: !Ref Environment}
+
+  SalesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub 'enm-sales-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - {AttributeName: saleId,    AttributeType: S}
+        - {AttributeName: userId,    AttributeType: S}
+        - {AttributeName: createdAt, AttributeType: S}
+        - {AttributeName: status,    AttributeType: S}
+        - {AttributeName: endDate,   AttributeType: S}
+      KeySchema:
+        - {AttributeName: saleId, KeyType: HASH}
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema:
+            - {AttributeName: userId,    KeyType: HASH}
+            - {AttributeName: createdAt, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: status-endDate-index
+          KeySchema:
+            - {AttributeName: status,  KeyType: HASH}
+            - {AttributeName: endDate, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      Tags:
+        - {Key: Project, Value: EstatesNearMe}
+        - {Key: Environment, Value: !Ref Environment}
+
+  ##############################################################################
+  # COGNITO USER POOL
+  ##############################################################################
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'enm-users-${Environment}'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - {Name: email, AttributeDataType: String, Required: true,  Mutable: true}
+        - {Name: name,  AttributeDataType: String, Required: false, Mutable: true}
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - {Name: verified_email, Priority: 1}
+      UserPoolTags:
+        Project: EstatesNearMe
+        Environment: !Ref Environment
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'enm-app-${Environment}'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      # Allow Cognito Hosted UI to redirect back to both the custom domain and www
+      CallbackURLs:
+        - !Sub 'https://${RootDomain}'
+        - !Sub 'https://www.${RootDomain}'
+      LogoutURLs:
+        - !Sub 'https://${RootDomain}'
+        - !Sub 'https://www.${RootDomain}'
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [email, openid, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders: [COGNITO]
+
+  # Cognito domain for the hosted UI (optional but useful for social login later)
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'auth-${AWS::AccountId}-${Environment}'
+      UserPoolId: !Ref CognitoUserPool
+
+  ##############################################################################
+  # S3 — IMAGE UPLOADS BUCKET
+  ##############################################################################
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'enm-uploads-${AWS::AccountId}-${Environment}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins:
+              - !Sub 'https://${RootDomain}'
+              - !Sub 'https://www.${RootDomain}'
+            MaxAge: 3000
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - {Id: ExpireOldVersions, Status: Enabled, NoncurrentVersionExpirationInDays: 30}
+      Tags:
+        - {Key: Project, Value: EstatesNearMe}
+
+  UploadsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadsBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${UploadsBucket}/*'
+
+  ##############################################################################
+  # WAF — REGIONAL (attached to API Gateway)
+  ##############################################################################
+  APIGatewayWAF:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub 'enm-api-waf-${Environment}'
+      Scope: REGIONAL
+      DefaultAction: {Allow: {}}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub 'ENMApiWAF${Environment}'
+      Rules:
+        - Name: AWSCoreRuleSet
+          Priority: 0
+          OverrideAction: {None: {}}
+          VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: CoreRuleSet}
+          Statement:
+            ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesCommonRuleSet}
+        - Name: BadInputsRuleSet
+          Priority: 1
+          OverrideAction: {None: {}}
+          VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: BadInputs}
+          Statement:
+            ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet}
+        - Name: SQLiRuleSet
+          Priority: 2
+          OverrideAction: {None: {}}
+          VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: SQLi}
+          Statement:
+            ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesSQLiRuleSet}
+        - Name: IPRateLimit
+          Priority: 3
+          Action: {Block: {}}
+          VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: IPRateLimit}
+          Statement:
+            RateBasedStatement: {Limit: 1000, AggregateKeyType: IP}
+
+  ##############################################################################
+  # LAMBDA BACKEND (Express app packaged as zip and fronted by API Gateway)
+  ##############################################################################
+  BackendLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'enm-lambda-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !GetAtt SalesTable.Arn
+                  - !Sub '${UsersTable.Arn}/index/*'
+                  - !Sub '${SalesTable.Arn}/index/*'
+        - PolicyName: S3UploadsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:PutObjectAcl]
+                Resource: !Sub 'arn:aws:s3:::${UploadsBucket}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt UploadsBucket.Arn
+        - PolicyName: CognitoReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [cognito-idp:GetUser, cognito-idp:AdminGetUser]
+                Resource: !GetAtt CognitoUserPool.Arn
+        - PolicyName: SSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/enm/*'
+
+  BackendLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [UsersTable, SalesTable, CognitoUserPool]
+    Properties:
+      FunctionName: !Sub 'enm-api-${Environment}'
+      Runtime: nodejs20.x
+      Architectures: [arm64]
+      Handler: lambda.handler
+      Timeout: 29
+      MemorySize: 1024
+      Role: !GetAtt BackendLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          NODE_ENV: production
+          AWS_REGION: !Ref AWS::Region
+          DYNAMODB_USERS_TABLE: !Ref UsersTable
+          DYNAMODB_SALES_TABLE: !Ref SalesTable
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+          S3_BUCKET_NAME: !Ref UploadsBucket
+          FRONTEND_URL: !Sub 'https://${RootDomain},https://www.${RootDomain}'
+
+  ##############################################################################
+  # API GATEWAY — HTTP API with Cognito JWT Authorizer + WAF
+  # Custom domain: api.findingestates.com
+  ##############################################################################
+  APIGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub 'enm-api-${Environment}'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub 'https://${RootDomain}'
+          - !Sub 'https://www.${RootDomain}'
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: [Content-Type, Authorization]
+        AllowCredentials: true
+        MaxAge: 300
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref APIGateway
+      AuthorizerType: JWT
+      Name: CognitoJWTAuthorizer
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref CognitoUserPoolClient]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}'
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref APIGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BackendLambdaFunction.Arn}/invocations'
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  APIGatewayInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/*/*'
+
+  # ── Public routes (no JWT required at GW) ───────────────────────────────────
+  RouteGetSales:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref APIGateway, RouteKey: 'GET /api/sales', Target: !Sub 'integrations/${LambdaIntegration}'}
+  RouteGetSaleById:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref APIGateway, RouteKey: 'GET /api/sales/{id}', Target: !Sub 'integrations/${LambdaIntegration}'}
+  RouteAuthProxy:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref APIGateway, RouteKey: 'POST /api/auth/{proxy+}', Target: !Sub 'integrations/${LambdaIntegration}'}
+  RouteHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref APIGateway, RouteKey: 'GET /api/health', Target: !Sub 'integrations/${LambdaIntegration}'}
+
+  # ── Protected routes (Cognito JWT required at GW) ───────────────────────────
+  RoutePostSales:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: 'POST /api/sales'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+  RoutePutSales:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: 'PUT /api/sales/{id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+  RouteDeleteSales:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: 'DELETE /api/sales/{id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+  RouteMySales:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: 'GET /api/sales/user/my-sales'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+  RouteUpload:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: 'POST /api/upload/{proxy+}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+  RouteMe:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: 'GET /api/auth/me'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  APIGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/enm-${Environment}'
+      RetentionInDays: 30
+
+  APIGatewayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref APIGateway
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
+      AccessLogSettings:
+        DestinationArn: !GetAtt APIGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+
+  # Custom domain for API Gateway → api.findingestates.com
+  APIGatewayCustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    DependsOn: Certificate
+    Properties:
+      DomainName: !Sub 'api.${RootDomain}'
+      DomainNameConfigurations:
+        - CertificateArn: !Ref Certificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  APIGatewayDomainMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    DependsOn: [APIGatewayStage, APIGatewayCustomDomain]
+    Properties:
+      ApiId: !Ref APIGateway
+      DomainName: !Sub 'api.${RootDomain}'
+      Stage: $default
+
+  # Attach WAF to the API Gateway stage
+  APIWAFAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: APIGatewayStage
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/apis/${APIGateway}/stages/$default'
+      WebACLArn: !GetAtt APIGatewayWAF.Arn
+
+  ##############################################################################
+  # AWS AMPLIFY HOSTING — serves the React frontend at findingestates.com
+  ##############################################################################
+
+  # IAM role Amplify uses to access SSM / build
+  AmplifyServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'enm-amplify-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: amplify.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess-Amplify
+      Policies:
+        - PolicyName: AmplifySSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/enm/*'
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    DependsOn: [CognitoUserPool, CognitoUserPoolClient, APIGatewayCustomDomain]
+    Properties:
+      Name: !Sub 'estatesnearm-${Environment}'
+      Repository: !Ref GitHubRepoUrl
+      AccessToken: !Ref AmplifyGitHubToken
+      IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
+      Description: EstatesNearMe React frontend
+      Platform: WEB
+
+      # Build settings — Amplify runs this in its build container
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - cd frontend
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: frontend/build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - frontend/node_modules/**/*
+
+      # Environment variables injected at build time
+      EnvironmentVariables:
+        - Name: REACT_APP_API_URL
+          Value: !Sub 'https://api.${RootDomain}/api'
+        - Name: REACT_APP_GOOGLE_MAPS_API_KEY
+          Value: !Ref GoogleMapsApiKey
+        - Name: REACT_APP_COGNITO_USER_POOL_ID
+          Value: !Ref CognitoUserPool
+        - Name: REACT_APP_COGNITO_CLIENT_ID
+          Value: !Ref CognitoUserPoolClient
+        - Name: REACT_APP_COGNITO_REGION
+          Value: !Ref AWS::Region
+        - Name: NODE_ENV
+          Value: production
+
+      # SPA redirect rules — all routes → index.html
+      CustomRules:
+        # Redirect www → apex
+        - Source: 'https://www.findingestates.com'
+          Target: 'https://findingestates.com'
+          Status: '302'
+        # SPA catch-all: serve index.html for client-side routes
+        - Source: '</^[^.]+$|\.(?!(css|gif|ico|jpg|jpeg|js|png|txt|svg|woff|woff2|ttf|map|json|webp)$)([^.]+$)/>'
+          Target: '/index.html'
+          Status: '200'
+
+      # Enable basic auth in staging to protect the preview environment
+      BasicAuthCredentials: !If
+        - IsProduction
+        - !Ref AWS::NoValue
+        - Fn::Base64: !Sub 'admin:${JwtSecret}'
+
+      Tags:
+        - {Key: Project, Value: EstatesNearMe}
+        - {Key: Environment, Value: !Ref Environment}
+
+  # Connect the main branch to Amplify
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref GitHubBranch
+      EnableAutoBuild: true
+      EnablePullRequestPreview: true
+      Stage: !If [IsProduction, PRODUCTION, DEVELOPMENT]
+      Description: !Sub '${Environment} branch'
+      EnvironmentVariables:
+        - Name: AMPLIFY_DIFF_DEPLOY
+          Value: 'false'
+
+  # Associate findingestates.com + www with the Amplify app
+  AmplifyDomain:
+    Type: AWS::Amplify::Domain
+    DependsOn: [AmplifyBranch, Certificate]
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      DomainName: !Ref RootDomain
+      EnableAutoSubDomain: false
+      SubDomainSettings:
+        # Root domain → main branch
+        - Prefix: ''
+          BranchName: !Ref GitHubBranch
+        # www → main branch
+        - Prefix: www
+          BranchName: !Ref GitHubBranch
+
+  ##############################################################################
+  # ROUTE 53 — DNS records
+  ##############################################################################
+
+  # findingestates.com → Amplify
+  # Amplify provides a DNS target we point to via CNAME (root uses ALIAS)
+  DNSRecordApex:
+    Type: AWS::Route53::RecordSet
+    DependsOn: AmplifyDomain
+    Properties:
+      HostedZoneId: !Ref Route53HostedZoneId
+      Name: !Sub '${RootDomain}.'
+      Type: A
+      AliasTarget:
+        # Amplify custom domain verification CNAME targets
+        # The actual Amplify domain to alias is exposed via AmplifyDomain output
+        DNSName: !GetAtt AmplifyDomain.DefaultDomain
+        HostedZoneId: Z2FDTNDATAQYW2   # CloudFront/Amplify global hosted zone ID (constant)
+        EvaluateTargetHealth: false
+
+  # www.findingestates.com → Amplify
+  DNSRecordWWW:
+    Type: AWS::Route53::RecordSet
+    DependsOn: AmplifyDomain
+    Properties:
+      HostedZoneId: !Ref Route53HostedZoneId
+      Name: !Sub 'www.${RootDomain}.'
+      Type: CNAME
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt AmplifyDomain.DefaultDomain
+
+  # api.findingestates.com → API Gateway custom domain
+  DNSRecordAPI:
+    Type: AWS::Route53::RecordSet
+    DependsOn: APIGatewayCustomDomain
+    Properties:
+      HostedZoneId: !Ref Route53HostedZoneId
+      Name: !Sub 'api.${RootDomain}.'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt APIGatewayCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt APIGatewayCustomDomain.RegionalHostedZoneId
+        EvaluateTargetHealth: false
+
+  ##############################################################################
+  # SSM PARAMETER STORE — secrets
+  ##############################################################################
+  SSMJwtSecret:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /enm/jwt-secret
+      Type: SecureString
+      Value: !Ref JwtSecret
+      Description: JWT signing secret (dev/staging)
+      Tags: {Project: EstatesNearMe}
+
+  SSMGoogleMapsKey:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /enm/google-maps-api-key
+      Type: SecureString
+      Value: !If [IsProduction, !Ref GoogleMapsApiKey, 'not-set']
+      Description: Google Maps API key
+      Tags: {Project: EstatesNearMe}
+
+  ##############################################################################
+  # CLOUDWATCH ALARMS + SNS
+  ##############################################################################
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'enm-alerts-${Environment}'
+      Subscription:
+        - {Protocol: email, Endpoint: !Ref AdminEmail}
+
+  WAFBlockAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'enm-waf-blocks-${Environment}'
+      AlarmDescription: More than 100 WAF-blocked requests in 5 minutes
+      Namespace: AWS/WAFV2
+      MetricName: BlockedRequests
+      Dimensions:
+        - {Name: WebACL,  Value: !Ref APIGatewayWAF}
+        - {Name: Region,  Value: !Ref 'AWS::Region'}
+        - {Name: Rule,    Value: ALL}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  API5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'enm-5xx-${Environment}'
+      AlarmDescription: Elevated 5xx errors from API Gateway
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - {Name: ApiId, Value: !Ref APIGateway}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUTS
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  FrontendURL:
+    Description: Live frontend URL
+    Value: !Sub 'https://${RootDomain}'
+    Export: {Name: !Sub 'enm-frontend-url-${Environment}'}
+
+  APIURL:
+    Description: API base URL
+    Value: !Sub 'https://api.${RootDomain}'
+    Export: {Name: !Sub 'enm-api-url-${Environment}'}
+
+  AmplifyAppId:
+    Description: Amplify App ID (needed for manual deploys / branch triggers)
+    Value: !GetAtt AmplifyApp.AppId
+    Export: {Name: !Sub 'enm-amplify-app-id-${Environment}'}
+
+  AmplifyDefaultDomain:
+    Description: Amplify-generated domain (before DNS propagation)
+    Value: !GetAtt AmplifyApp.DefaultDomain
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export: {Name: !Sub 'enm-cognito-pool-${Environment}'}
+
+  CognitoClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export: {Name: !Sub 'enm-cognito-client-${Environment}'}
+
+  CognitoHostedUIURL:
+    Description: Cognito hosted UI (for future social login integration)
+    Value: !Sub 'https://auth-${AWS::AccountId}-${Environment}.auth.${AWS::Region}.amazoncognito.com'
+
+  UsersTableName:
+    Description: DynamoDB Users table
+    Value: !Ref UsersTable
+
+  SalesTableName:
+    Description: DynamoDB Sales table
+    Value: !Ref SalesTable
+
+  UploadsBucketName:
+    Description: S3 bucket for image uploads
+    Value: !Ref UploadsBucket
+
+  BackendLambdaName:
+    Description: Lambda function name for API backend
+    Value: !Ref BackendLambdaFunction
+
+  BackendLambdaArn:
+    Description: Lambda function ARN for API backend
+    Value: !GetAtt BackendLambdaFunction.Arn
+
+  CertificateArn:
+    Description: ACM Certificate ARN (covers root, www, and api subdomains)
+    Value: !Ref Certificate
