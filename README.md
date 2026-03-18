@@ -1,6 +1,6 @@
 # EstatesNearMe v2
 
-A full-stack community platform for discovering and posting local estate sales. Built with **React**, **Express**, **AWS DynamoDB**, **AWS Cognito**, protected by **API Gateway** and **WAF**.
+A full-stack community platform for discovering and posting local estate sales. Built with **React**, **Express**, **AWS DynamoDB**, **AWS Cognito**, **AWS Lambda**, **API Gateway**, and **WAF**.
 
 ---
 
@@ -9,33 +9,30 @@ A full-stack community platform for discovering and posting local estate sales. 
 ```
 Browser
   │
-  ▼
-CloudFront (HTTPS, WAF OWASP rules, security headers)
-  ├── /          → S3  (React SPA, private via OAC)
-  └── /api/*     → API Gateway HTTP API
-                       │
-                       ├── JWT Authorizer (Cognito) — validates tokens on protected routes
-                       ├── WAF (OWASP Core, SQLi, Bad Inputs, IP rate limit)
-                       └── ALB → EC2 (Express + Node.js)
-                                      │
-                                      ├── DynamoDB  (Users + Sales tables)
-                                      ├── S3        (Image uploads)
-                                      └── Cognito   (User Pool — auth source of truth)
+   ├── findingestates.com      → Amplify Hosting (React SPA, CDN, SSL)
+   └── api.findingestates.com  → API Gateway HTTP API
+                                                    │
+                                                    ├── JWT Authorizer (Cognito) — validates protected routes
+                                                    ├── WAF (OWASP Core, SQLi, Bad Inputs, IP rate limit)
+                                                    └── Lambda (Express via `serverless-http`)
+                                                               │
+                                                               ├── DynamoDB  (Users + Sales tables)
+                                                               ├── S3        (Image uploads)
+                                                               └── Cognito   (User Pool — auth source of truth)
 ```
 
 ### Security Layers
 
 | Layer | Control |
 |-------|---------|
-| **CloudFront WAF** | OWASP Core Rule Set, IP rate limiting (2000 req/5 min) |
 | **API Gateway WAF** | OWASP Core, SQLi, Bad Inputs, IP rate limiting (1000 req/5 min) |
 | **API Gateway JWT Authorizer** | Validates Cognito tokens on all write/protected routes |
+| **API Gateway stage throttling** | Burst limit 200, steady rate 100 req/sec at the gateway |
 | **Express helmet** | CSP, HSTS, X-Frame-Options, XSS protection headers |
 | **Express rate limiter** | Per-IP: 100 req/15 min (API), 10 req/15 min (auth), 10/hr (upload) |
-| **EC2 Security Group** | Inbound 5000 only from ALB security group — never direct internet |
+| **Lambda IAM role** | Least privilege access to specific DynamoDB tables, S3 upload bucket, Cognito, and SSM |
 | **DynamoDB** | Encryption at rest (AWS managed key), Point-in-Time Recovery enabled |
-| **S3 Frontend** | Private bucket — only accessible via CloudFront OAC |
-| **IAM EC2 Role** | Least privilege: only specific DynamoDB actions on specific tables |
+| **Amplify Hosting** | Managed HTTPS hosting, branch deploys, and domain mapping for the SPA |
 | **Cognito** | Email verification, MFA support (TOTP), token revocation on logout |
 
 ---
@@ -52,6 +49,7 @@ estatesnearm/
 │       └── utils/api.js          # Axios + JWT injection
 │
 ├── backend/                      # Express API
+│   ├── lambda.js                 # Lambda entrypoint wrapping Express with serverless-http
 │   ├── lib/dynamodb.js           # DynamoDB Document Client
 │   ├── models/
 │   │   ├── User.js               # DynamoDB user CRUD + bcrypt (dev)
@@ -67,7 +65,8 @@ estatesnearm/
 │
 └── infrastructure/
     ├── cloudformation.yml        # Full AWS stack
-    ├── deploy.sh                 # CI/CD deployment script
+   ├── deploy.js                 # npm-driven deployment entrypoint
+   ├── deploy.sh                 # Backward-compatible wrapper around npm deploy
     └── setup-dynamodb.sh         # Create DynamoDB tables locally or in AWS
 ```
 
@@ -164,48 +163,94 @@ Refresh  → Cognito REFRESH_TOKEN_AUTH → New IdToken issued
 
 ### Prerequisites
 - AWS CLI configured with admin permissions
-- EC2 Key Pair created in the target region
+- Route 53 hosted zone for `findingestates.com`
+- GitHub Personal Access Token (`repo` scope) for Amplify
 - `AdminEmail` for CloudWatch alarm notifications
+
+### Deployment environment files
+
+Deployment config now lives in root-level environment files:
+
+- `.env.production` → used by `npm run deploy:production`
+- `.env.development` → used by `npm run deploy:development`
+
+`.env.development` defaults to `DEPLOY_ENVIRONMENT=staging`, so the development deploy command updates the staging stack unless you change that value.
+
+Example variables in those files:
+
+```env
+DEPLOY_ENVIRONMENT=production
+AWS_REGION=us-east-1
+ROOT_DOMAIN=findingestates.com
+JWT_SECRET=replace_with_a_32_character_minimum_secret
+ADMIN_EMAIL=you@example.com
+LAMBDA_CODE_S3_BUCKET=your-artifacts-bucket
+LAMBDA_CODE_S3_KEY=backend/lambda-production.zip
+ROUTE53_HOSTED_ZONE_ID=Z1D633PJN98FT9
+GITHUB_REPO_URL=https://github.com/YOUR_ORG/estatesnearm
+GITHUB_BRANCH=main
+AMPLIFY_GITHUB_TOKEN=ghp_replace_me
+REACT_APP_GOOGLE_MAPS_API_KEY=your_maps_key
+```
+
+If `LAMBDA_CODE_S3_BUCKET` is blank or left as `your-artifacts-bucket`, the deploy command auto-creates a private artifact bucket in your AWS account and uses that instead.
 
 ### Deploy
 
 ```bash
-export JWT_SECRET="your_32_char_secret_for_dev_staging"
-export KEY_PAIR_NAME="your-ec2-keypair"
-export ADMIN_EMAIL="you@example.com"
-export REACT_APP_GOOGLE_MAPS_API_KEY="your_maps_key"
+npm run deploy:production
 
-chmod +x infrastructure/deploy.sh
-./infrastructure/deploy.sh production us-east-1
+# or deploy the staging stack using values from .env.development
+npm run deploy:development
 ```
 
-**What `deploy.sh` does:**
-1. Deploys/updates the CloudFormation stack (all AWS resources)
-2. Reads outputs (bucket names, Cognito IDs, etc.)
-3. Builds the React app with the correct Cognito config injected
-4. Syncs the build to S3 with proper cache headers
-5. Invalidates CloudFront
+**What the deploy command does:**
+1. Loads deployment variables from `.env.production` or `.env.development`
+2. Runs `npm install --omit=dev` in `backend/` and packages the Express API as a Lambda zip
+3. Uploads that zip to `s3://$LAMBDA_CODE_S3_BUCKET/$LAMBDA_CODE_S3_KEY`
+4. Deploys/updates the CloudFormation stack (Lambda, API Gateway, WAF, Cognito, DynamoDB, Amplify, Route 53)
+5. Reads stack outputs (frontend URL, API URL, Cognito IDs, Lambda name, uploads bucket)
+6. Triggers an Amplify build for the configured branch
 
-### After stack creation — deploy your backend code to EC2
+### Redeploy after backend changes
 
 ```bash
-# SSH in (or use SSM Session Manager — no SSH key needed)
-aws ssm start-session --target <instance-id> --region us-east-1
+# Re-run the npm deploy command. It will rebuild the Lambda zip,
+# upload it to S3, and update the Lambda-backed API stack.
+npm run deploy:production
+```
 
-# On the EC2 instance:
-cd /var/app/estatesnearm
-git clone https://github.com/YOUR_ORG/estatesnearm.git .
-cd backend
-npm install --production
-pm2 start server.js --name enm-backend --env production
-pm2 startup systemd -u ec2-user && pm2 save
+### Optional: override the Lambda artifact key
+
+```bash
+LAMBDA_CODE_S3_KEY=backend/lambda-hotfix.zip npm run deploy:production
+```
+
+The default key is `backend/lambda-<environment>.zip`.
+
+### Optional: override the AWS region
+
+```bash
+npm run deploy -- production us-east-1
+```
+
+### Post-deploy checks
+
+```bash
+# Stack outputs
+aws cloudformation describe-stacks \
+   --stack-name estatesnearm-production \
+   --region us-east-1
+
+# Lambda logs
+aws logs tail /aws/lambda/enm-api-production --follow --region us-east-1
 ```
 
 ---
 
 ## 📡 API Reference
 
-All endpoints are accessed via `https://your-cloudfront-url/api/...`
+All endpoints are accessed via `https://api.findingestates.com/api/...`
 
 ### Auth (public)
 | Method | Path | Description |
@@ -285,10 +330,10 @@ All endpoints are accessed via `https://your-cloudfront-url/api/...`
 | Backend | Node.js 20, Express 4, helmet, morgan |
 | Database | AWS DynamoDB (on-demand, PITR, encrypted at rest) |
 | Auth | AWS Cognito User Pool (prod) / bcrypt+JWT (dev) |
-| Image Storage | AWS S3 with IAM instance role |
+| Image Storage | AWS S3 with IAM Lambda role |
 | API Security | AWS API Gateway HTTP API + JWT Authorizer + WAF |
-| CDN | AWS CloudFront + OAC + WAF + Security Headers Policy |
-| Infra | CloudFormation (VPC, EC2, ALB, DynamoDB, Cognito, WAF, SNS) |
+| Frontend Hosting | AWS Amplify Hosting |
+| Infra | CloudFormation (Lambda, API Gateway, Amplify, DynamoDB, Cognito, WAF, Route 53, SNS) |
 
 ---
 
@@ -307,7 +352,7 @@ The CloudFormation template automatically provisions everything needed to serve 
 |----------|------|
 | **ACM Certificate** | Covers `findingestates.com`, `www.findingestates.com`, `api.findingestates.com` — DNS-validated automatically via Route 53 |
 | **Amplify Hosting** | Serves the React SPA at `findingestates.com` and `www.findingestates.com`. Auto-deploys on every push to `main` |
-| **API Gateway Custom Domain** | `api.findingestates.com` → API Gateway → ALB → EC2 (Express) |
+| **API Gateway Custom Domain** | `api.findingestates.com` → API Gateway → Lambda (Express) |
 | **Route 53 A record** | `findingestates.com` → Amplify (ALIAS) |
 | **Route 53 CNAME** | `www.findingestates.com` → Amplify |
 | **Route 53 A record** | `api.findingestates.com` → API Gateway regional endpoint (ALIAS) |
@@ -317,12 +362,12 @@ The CloudFormation template automatically provisions everything needed to serve 
 ```
 findingestates.com       → Amplify Hosting (React SPA, CDN, SSL)
 www.findingestates.com   → Amplify Hosting (redirects to apex)
-api.findingestates.com   → API Gateway → WAF → ALB → EC2 (Express + DynamoDB)
+api.findingestates.com   → API Gateway → WAF → Lambda (Express + DynamoDB)
 ```
 
 ### Deploy prerequisites
 
-Before running `deploy.sh` you need:
+Before running `npm run deploy:production` you need:
 
 1. **Route 53 Hosted Zone ID** for `findingestates.com`
    - Open [Route 53 console](https://console.aws.amazon.com/route53/v2/hostedzones)
@@ -335,15 +380,7 @@ Before running `deploy.sh` you need:
 ### Deploy
 
 ```bash
-export JWT_SECRET="your_32_char_minimum_secret_here"
-export ADMIN_EMAIL="you@example.com"
-export KEY_PAIR_NAME="your-ec2-keypair"
-export ROUTE53_HOSTED_ZONE_ID="Z1D633PJN98FT9"    # your actual zone ID
-export GITHUB_REPO_URL="https://github.com/YOUR_ORG/estatesnearm"
-export AMPLIFY_GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
-export REACT_APP_GOOGLE_MAPS_API_KEY="your_maps_key"
-
-./infrastructure/deploy.sh production us-east-1
+npm run deploy:production
 ```
 
 ### What Amplify does automatically
@@ -358,5 +395,14 @@ export REACT_APP_GOOGLE_MAPS_API_KEY="your_maps_key"
 ### Timing notes
 
 - **ACM certificate** validation is automatic via Route 53 DNS but takes **5–10 minutes** on first stack creation
+- **CloudFormation first run** can take **10–15 minutes** because certificate issuance and domain mapping happen in the same workflow
 - **Amplify first build** takes ~3 minutes
 - **DNS propagation** for `findingestates.com` takes **up to 60 minutes** globally after Amplify confirms the domain
+
+### What the npm deploy command does for the API
+
+- **Packages** `backend/` into a Lambda zip from the repo root
+- **Creates** the Lambda artifact bucket automatically if you leave the default placeholder or omit the bucket name
+- **Uploads** the artifact to your S3 deployment bucket
+- **Updates** the Lambda function code through CloudFormation
+- **Prints** the Lambda function name, API URL, Cognito IDs, and uploads bucket after deploy
