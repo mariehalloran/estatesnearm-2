@@ -119,7 +119,7 @@ Resources:
       TableName: !Sub 'enm-users-${Environment}'
       BillingMode: PAY_PER_REQUEST
       PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
       SSESpecification:
         SSEEnabled: true
       AttributeDefinitions:
@@ -146,7 +146,7 @@ Resources:
       TableName: !Sub 'enm-sales-${Environment}'
       BillingMode: PAY_PER_REQUEST
       PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
       SSESpecification:
         SSEEnabled: true
       AttributeDefinitions:
@@ -278,10 +278,11 @@ Resources:
             Resource: !Sub 'arn:aws:s3:::${UploadsBucket}/*'
 
   ##############################################################################
-  # WAF — REGIONAL (attached to API Gateway)
+  # WAF — REGIONAL (production only — $9/month fixed cost even with no traffic)
   ##############################################################################
   APIGatewayWAF:
     Type: AWS::WAFv2::WebACL
+    Condition: IsProduction
     Properties:
       Name: !Sub 'enm-api-waf-${Environment}'
       Scope: REGIONAL
@@ -548,13 +549,9 @@ Resources:
       DomainName: !Sub 'api.${RootDomain}'
       Stage: $default
 
-  # Attach WAF to the API Gateway stage
-  APIWAFAssociation:
-    Type: AWS::WAFv2::WebACLAssociation
-    DependsOn: APIGatewayStage
-    Properties:
-      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/apis/${APIGateway}/stages/$default'
-      WebACLArn: !GetAtt APIGatewayWAF.Arn
+  # NOTE: AWS WAF WebACLAssociation only supports API Gateway REST APIs (v1),
+  # not HTTP APIs (v2). WAF rules are defined above (APIGatewayWAF) and can be
+  # associated via CloudFront if a CDN layer is added in front of the API later.
 
   ##############################################################################
   # AWS AMPLIFY HOSTING — serves the React frontend at findingestates.com
@@ -640,12 +637,6 @@ Resources:
           Target: '/index.html'
           Status: '200'
 
-      # Enable basic auth in staging to protect the preview environment
-      BasicAuthCredentials: !If
-        - IsProduction
-        - !Ref AWS::NoValue
-        - Fn::Base64: !Sub 'admin:${JwtSecret}'
-
       Tags:
         - {Key: Project, Value: EstatesNearMe}
         - {Key: Environment, Value: !Ref Environment}
@@ -660,6 +651,13 @@ Resources:
       EnablePullRequestPreview: true
       Stage: !If [IsProduction, PRODUCTION, DEVELOPMENT]
       Description: !Sub '${Environment} branch'
+      # Basic auth protects the staging branch from public access
+      BasicAuthConfig: !If
+        - IsProduction
+        - !Ref AWS::NoValue
+        - EnableBasicAuth: true
+          Username: admin
+          Password: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       EnvironmentVariables:
         - Name: AMPLIFY_DIFF_DEPLOY
           Value: 'false'
@@ -757,6 +755,7 @@ Resources:
 
   WAFBlockAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
     Properties:
       AlarmName: !Sub 'enm-waf-blocks-${Environment}'
       AlarmDescription: More than 100 WAF-blocked requests in 5 minutes
