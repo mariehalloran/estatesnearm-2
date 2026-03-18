@@ -393,7 +393,6 @@ Resources:
       Environment:
         Variables:
           NODE_ENV: production
-          AWS_REGION: !Ref AWS::Region
           DYNAMODB_USERS_TABLE: !Ref UsersTable
           DYNAMODB_SALES_TABLE: !Ref SalesTable
           COGNITO_USER_POOL_ID: !Ref CognitoUserPool
@@ -695,9 +694,8 @@ Resources:
       Name: !Sub '${RootDomain}.'
       Type: A
       AliasTarget:
-        # Amplify custom domain verification CNAME targets
-        # The actual Amplify domain to alias is exposed via AmplifyDomain output
-        DNSName: !GetAtt AmplifyDomain.DefaultDomain
+        # Points to the Amplify app's CloudFront-backed default domain
+        DNSName: !GetAtt AmplifyApp.DefaultDomain
         HostedZoneId: Z2FDTNDATAQYW2   # CloudFront/Amplify global hosted zone ID (constant)
         EvaluateTargetHealth: false
 
@@ -711,7 +709,7 @@ Resources:
       Type: CNAME
       TTL: '300'
       ResourceRecords:
-        - !GetAtt AmplifyDomain.DefaultDomain
+        - !GetAtt AmplifyApp.DefaultDomain
 
   # api.findingestates.com → API Gateway custom domain
   DNSRecordAPI:
@@ -733,7 +731,7 @@ Resources:
     Type: AWS::SSM::Parameter
     Properties:
       Name: /enm/jwt-secret
-      Type: SecureString
+      Type: String
       Value: !Ref JwtSecret
       Description: JWT signing secret (dev/staging)
       Tags: {Project: EstatesNearMe}
@@ -742,7 +740,7 @@ Resources:
     Type: AWS::SSM::Parameter
     Properties:
       Name: /enm/google-maps-api-key
-      Type: SecureString
+      Type: String
       Value: !If [IsProduction, !Ref GoogleMapsApiKey, 'not-set']
       Description: Google Maps API key
       Tags: {Project: EstatesNearMe}
