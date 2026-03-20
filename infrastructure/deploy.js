@@ -253,6 +253,10 @@ function buildConfig(target, cliRegion) {
     requiredKeys.push('GITHUB_REPO_URL', 'AMPLIFY_GITHUB_TOKEN');
   }
 
+  if (!config.createDynamoDBTables) {
+    requiredKeys.push('EXISTING_USERS_TABLE_NAME', 'EXISTING_SALES_TABLE_NAME');
+  }
+
   ensureRequired(config, requiredKeys);
 
   if (config.JWT_SECRET.length < 32) {
@@ -269,7 +273,7 @@ function buildConfig(target, cliRegion) {
 function packageBackend() {
   logStep('Packaging backend for Lambda...');
 
-  run('npm', ['install', '--omit=dev'], { cwd: backendDir });
+  run('npm', ['install', '--omit=dev', '--workspaces=false'], { cwd: backendDir });
 
   const zipPath = path.join(os.tmpdir(), `enm-lambda-${Date.now()}.zip`);
   run('zip', ['-qr', zipPath, '.'], { cwd: backendDir });

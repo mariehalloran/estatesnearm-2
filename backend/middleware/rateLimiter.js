@@ -1,9 +1,20 @@
 const rateLimit = require('express-rate-limit');
 
+function getClientKey(req) {
+  const forwarded = req.headers?.['x-forwarded-for'];
+  const fromHeader = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  return req.ip
+    || (fromHeader ? String(fromHeader).split(',')[0].trim() : null)
+    || req.socket?.remoteAddress
+    || 'unknown';
+}
+
 // General API limiter — 100 req / 15 min per IP
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
+  keyGenerator: getClientKey,
+  validate: false,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests. Please try again in a few minutes.' },
@@ -13,6 +24,8 @@ const apiLimiter = rateLimit({
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  keyGenerator: getClientKey,
+  validate: false,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many authentication attempts. Please wait 15 minutes.' },
@@ -22,6 +35,8 @@ const authLimiter = rateLimit({
 const writeLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
+  keyGenerator: getClientKey,
+  validate: false,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many write operations. Please slow down.' },
@@ -31,6 +46,8 @@ const writeLimiter = rateLimit({
 const uploadLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 10,
+  keyGenerator: getClientKey,
+  validate: false,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Upload limit reached. Try again in an hour.' },

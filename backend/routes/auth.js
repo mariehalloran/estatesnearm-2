@@ -74,8 +74,8 @@ router.post('/register',
       }
 
       // Production: Cognito SignUp
-      const { SignUpCommand, AdminUpdateUserAttributesCommand } = require('@aws-sdk/client-cognito-identity-provider');
-      await cognitoClient.send(new SignUpCommand({
+      const { SignUpCommand } = require('@aws-sdk/client-cognito-identity-provider');
+      const signUpResult = await cognitoClient.send(new SignUpCommand({
         ClientId: process.env.COGNITO_CLIENT_ID,
         Username: email,
         Password: password,
@@ -84,6 +84,16 @@ router.post('/register',
           { Name: 'name', Value: name },
         ],
       }));
+
+      try {
+        await UserModel.upsertCognitoProfile({
+          name,
+          email,
+          cognitoSub: signUpResult.UserSub,
+        });
+      } catch (profileError) {
+        console.error('Register profile sync error:', profileError);
+      }
 
       res.status(201).json({
         success: true,
@@ -124,9 +134,12 @@ router.post('/confirm',
         ConfirmationCode: code,
       }));
 
-      // Create DynamoDB profile on confirmation
+      // Ensure DynamoDB profile exists on confirmation
       try {
-        await UserModel.create({ email, name: email.split('@')[0], cognitoSub: null });
+        const existingUser = await UserModel.getByEmail(email);
+        if (!existingUser) {
+          await UserModel.create({ email, name: email.split('@')[0] });
+        }
       } catch { /* profile may already exist */ }
 
       res.json({ success: true, message: 'Email confirmed. You can now sign in.' });
@@ -173,16 +186,11 @@ router.post('/login',
       // Ensure DynamoDB profile exists
       const jwt_decode = require('jsonwebtoken');
       const decoded = jwt_decode.decode(IdToken);
-      let user = await UserModel.getByEmail(email);
-      if (!user) {
-        try {
-          user = await UserModel.create({
-            name: decoded.name || email.split('@')[0],
-            email,
-            cognitoSub: decoded.sub,
-          });
-        } catch { user = await UserModel.getByEmail(email); }
-      }
+      const user = await UserModel.upsertCognitoProfile({
+        name: decoded.name || email.split('@')[0],
+        email,
+        cognitoSub: decoded.sub,
+      });
 
       res.json({
         success: true,
@@ -241,7 +249,8 @@ router.post('/logout', protect, async (req, res) => {
 // ─── GET /api/auth/me ─────────────────────────────────────────────────────────
 router.get('/me', protect, async (req, res) => {
   try {
-    const user = await UserModel.getById(req.user.userId);
+    const user = await UserModel.getById(req.user.userId)
+      || await UserModel.getByCognitoSub(req.user.userId);
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     res.json({ success: true, user: UserModel.sanitize(user) });
   } catch (err) {

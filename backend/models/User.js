@@ -15,6 +15,7 @@ const {
   PutCommand,
   GetCommand,
   QueryCommand,
+  UpdateCommand,
 } = require('@aws-sdk/lib-dynamodb');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
@@ -36,9 +37,46 @@ const UserModel = {
     await dynamo.send(new PutCommand({
       TableName: TABLE,
       Item: item,
-      ConditionExpression: 'attribute_not_exists(email)',
+      ConditionExpression: 'attribute_not_exists(userId)',
     }));
     return item;
+  },
+
+  async update(userId, attributes) {
+    const updates = [];
+    const names = {};
+    const values = {};
+
+    if (attributes.name !== undefined) {
+      updates.push('#name = :name');
+      names['#name'] = 'name';
+      values[':name'] = attributes.name.trim();
+    }
+
+    if (attributes.email !== undefined) {
+      updates.push('email = :email');
+      values[':email'] = attributes.email.toLowerCase().trim();
+    }
+
+    if (attributes.cognitoSub !== undefined) {
+      updates.push('cognitoSub = :cognitoSub');
+      values[':cognitoSub'] = attributes.cognitoSub;
+    }
+
+    if (updates.length === 0) {
+      return this.getById(userId);
+    }
+
+    const result = await dynamo.send(new UpdateCommand({
+      TableName: TABLE,
+      Key: { userId },
+      UpdateExpression: `SET ${updates.join(', ')}`,
+      ...(Object.keys(names).length > 0 ? { ExpressionAttributeNames: names } : {}),
+      ExpressionAttributeValues: values,
+      ReturnValues: 'ALL_NEW',
+    }));
+
+    return result.Attributes || null;
   },
 
   async getById(userId) {
@@ -69,6 +107,20 @@ const UserModel = {
       Limit: 1,
     }));
     return res.Items?.[0] || null;
+  },
+
+  async upsertCognitoProfile({ name, email, cognitoSub }) {
+    const existingBySub = await this.getByCognitoSub(cognitoSub);
+    if (existingBySub) {
+      return this.update(existingBySub.userId, { name, email, cognitoSub });
+    }
+
+    const existingByEmail = await this.getByEmail(email);
+    if (existingByEmail) {
+      return this.update(existingByEmail.userId, { name, email, cognitoSub });
+    }
+
+    return this.create({ name, email, cognitoSub });
   },
 
   async hashPassword(plain) {
