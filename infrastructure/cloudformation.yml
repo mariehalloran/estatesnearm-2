@@ -36,6 +36,11 @@ Parameters:
     Default: ''
     Description: Google Maps JavaScript API key
 
+  GoogleMapsMapId:
+    Type: String
+    Default: ''
+    Description: Google Maps Map ID used for AdvancedMarkerElement support
+
   AdminEmail:
     Type: String
     Description: Email for CloudWatch alarms and Cognito admin
@@ -717,6 +722,8 @@ Resources:
           Value: !Sub 'https://api.${RootDomain}/api'
         - Name: REACT_APP_GOOGLE_MAPS_API_KEY
           Value: !Ref GoogleMapsApiKey
+        - Name: REACT_APP_GOOGLE_MAPS_MAP_ID
+          Value: !Ref GoogleMapsMapId
         - Name: REACT_APP_COGNITO_USER_POOL_ID
           Value: !Ref CognitoUserPool
         - Name: REACT_APP_COGNITO_CLIENT_ID

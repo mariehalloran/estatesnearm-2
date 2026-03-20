@@ -1,5 +1,5 @@
-import React, { useState, useCallback, useRef } from 'react';
-import { GoogleMap, useJsApiLoader, Marker, InfoWindow } from '@react-google-maps/api';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { GoogleMap, useJsApiLoader, InfoWindow } from '@react-google-maps/api';
 import { Link } from 'react-router-dom';
 import { formatShortDate } from '../utils/dateUtils';
 import './MapView.css';
@@ -23,14 +23,69 @@ const MAP_STYLES = [
 const MAP_CONTAINER = { width: '100%', height: '100%' };
 const DEFAULT_CENTER = { lat: 39.8283, lng: -98.5795 }; // USA center
 const DEFAULT_ZOOM = 5;
+const MAP_ID = process.env.REACT_APP_GOOGLE_MAPS_MAP_ID || 'DEMO_MAP_ID';
+const USER_PIN_OPTIONS = {
+  background: '#636B2F',
+  borderColor: '#ffffff',
+  glyphColor: '#ffffff',
+  scale: 1.1,
+};
+const SALE_PIN_OPTIONS = {
+  background: '#3D4127',
+  borderColor: '#D4DE95',
+  glyphColor: '#D4DE95',
+  scale: 1.1,
+};
+
+function AdvancedMarker({ map, position, title, onClick, pinOptions, zIndex }) {
+  const markerRef = useRef(null);
+  const listenerRef = useRef(null);
+
+  useEffect(() => {
+    if (!map || !position || !window.google?.maps?.marker?.AdvancedMarkerElement) {
+      return undefined;
+    }
+
+    const { AdvancedMarkerElement, PinElement } = window.google.maps.marker;
+    const pin = new PinElement(pinOptions);
+    const marker = new AdvancedMarkerElement({
+      map,
+      position,
+      title,
+      content: pin.element,
+      zIndex,
+    });
+
+    markerRef.current = marker;
+
+    if (onClick) {
+      listenerRef.current = marker.addListener('click', onClick);
+    }
+
+    return () => {
+      if (listenerRef.current) {
+        listenerRef.current.remove();
+        listenerRef.current = null;
+      }
+
+      if (markerRef.current) {
+        markerRef.current.map = null;
+        markerRef.current = null;
+      }
+    };
+  }, [map, onClick, pinOptions, position, title, zIndex]);
+
+  return null;
+}
 
 export default function MapView({ sales, userLocation, onBoundsChange }) {
   const [selectedSale, setSelectedSale] = useState(null);
+  const [mapInstance, setMapInstance] = useState(null);
   const mapRef = useRef(null);
 
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY || '',
-    libraries: ['places'],
+    libraries: ['places', 'marker'],
   });
 
   const center = userLocation
@@ -41,6 +96,7 @@ export default function MapView({ sales, userLocation, onBoundsChange }) {
 
   const onLoad = useCallback((map) => {
     mapRef.current = map;
+    setMapInstance(map);
   }, []);
 
   const onIdle = useCallback(() => {
@@ -74,6 +130,7 @@ export default function MapView({ sales, userLocation, onBoundsChange }) {
       zoom={zoom}
       options={{
         styles: MAP_STYLES,
+        mapId: MAP_ID,
         disableDefaultUI: false,
         zoomControl: true,
         mapTypeControl: false,
@@ -84,17 +141,11 @@ export default function MapView({ sales, userLocation, onBoundsChange }) {
       onIdle={onIdle}
     >
       {/* User location marker */}
-      {userLocation && (
-        <Marker
+      {userLocation && mapInstance && (
+        <AdvancedMarker
+          map={mapInstance}
           position={{ lat: userLocation.lat, lng: userLocation.lng }}
-          icon={{
-            path: window.google.maps.SymbolPath.CIRCLE,
-            scale: 10,
-            fillColor: '#636B2F',
-            fillOpacity: 1,
-            strokeColor: '#ffffff',
-            strokeWeight: 3,
-          }}
+          pinOptions={USER_PIN_OPTIONS}
           title="Your location"
           zIndex={1000}
         />
@@ -104,20 +155,16 @@ export default function MapView({ sales, userLocation, onBoundsChange }) {
       {sales.map((sale) => {
         const [lng, lat] = sale.location.coordinates;
         return (
-          <Marker
-            key={sale._id}
-            position={{ lat, lng }}
-            onClick={() => setSelectedSale(sale)}
-            icon={{
-              path: 'M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z',
-              fillColor: '#3D4127',
-              fillOpacity: 1,
-              strokeColor: '#D4DE95',
-              strokeWeight: 1.5,
-              scale: 1.6,
-              anchor: new window.google.maps.Point(12, 22),
-            }}
-          />
+          mapInstance && (
+            <AdvancedMarker
+              key={sale._id}
+              map={mapInstance}
+              position={{ lat, lng }}
+              onClick={() => setSelectedSale(sale)}
+              pinOptions={SALE_PIN_OPTIONS}
+              title={sale.title}
+            />
+          )
         );
       })}
 

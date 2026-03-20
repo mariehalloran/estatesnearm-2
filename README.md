@@ -191,6 +191,7 @@ GITHUB_REPO_URL=https://github.com/YOUR_ORG/estatesnearm
 GITHUB_BRANCH=main
 AMPLIFY_GITHUB_TOKEN=ghp_replace_me
 REACT_APP_GOOGLE_MAPS_API_KEY=your_maps_key
+REACT_APP_GOOGLE_MAPS_MAP_ID=your_google_maps_map_id
 ```
 
 Optional (reuse existing Amplify app and skip creating Amplify resources):

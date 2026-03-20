@@ -392,6 +392,7 @@ function deployCloudFormation(config) {
     `LambdaCodeS3Key=${config.lambdaCodeKey}`,
     `JwtSecret=${config.JWT_SECRET}`,
     `GoogleMapsApiKey=${config.REACT_APP_GOOGLE_MAPS_API_KEY || ''}`,
+    `GoogleMapsMapId=${config.REACT_APP_GOOGLE_MAPS_MAP_ID || ''}`,
     `AdminEmail=${config.ADMIN_EMAIL}`,
     `RootDomain=${config.rootDomain}`,
     `Route53HostedZoneId=${config.ROUTE53_HOSTED_ZONE_ID}`,
