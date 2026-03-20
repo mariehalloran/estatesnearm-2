@@ -136,6 +136,62 @@ function resolveArtifactBucket(values, deployEnvironment, region) {
   return `estatesnearm-artifacts-${accountId}-${region}-${deployEnvironment}`;
 }
 
+function route53RecordExists(hostedZoneId, recordName, recordType) {
+  const count = capture('aws', [
+    'route53',
+    'list-resource-record-sets',
+    '--hosted-zone-id',
+    hostedZoneId,
+    '--query',
+    `length(ResourceRecordSets[?Name=='${recordName}' && Type=='${recordType}'])`,
+    '--output',
+    'text',
+  ]);
+
+  return Number.parseInt(count, 10) > 0;
+}
+
+function autoSkipAmplifyDnsWhenRecordsExist(config) {
+  if (!config.manageAmplifyRoute53Records || config.useExistingAmplifyApp) {
+    return;
+  }
+
+  const apexRecord = `${config.rootDomain}.`;
+  const wwwRecord = `www.${config.rootDomain}.`;
+  const apexExists = route53RecordExists(config.ROUTE53_HOSTED_ZONE_ID, apexRecord, 'A');
+  const wwwExists = route53RecordExists(config.ROUTE53_HOSTED_ZONE_ID, wwwRecord, 'CNAME');
+
+  if (!apexExists && !wwwExists) {
+    return;
+  }
+
+  logStep('Existing Route 53 records detected; auto-skipping Amplify DNS record creation...');
+
+  if (apexExists) {
+    console.log(`   •  Found existing A record: ${apexRecord}`);
+  }
+
+  if (wwwExists) {
+    console.log(`   •  Found existing CNAME record: ${wwwRecord}`);
+  }
+
+  config.manageAmplifyRoute53Records = false;
+  logOk('CloudFormation will skip creating apex/www Amplify Route 53 records.');
+}
+
+function validateAmplifyGitHubToken(token) {
+  const trimmed = (token || '').trim();
+
+  if (trimmed.startsWith('github_pat_')) {
+    throw new Error(
+      'AMPLIFY_GITHUB_TOKEN appears to be a GitHub fine-grained token (github_pat_*). '
+      + 'Amplify repository setup can fail with 403 webhook errors when using fine-grained tokens. '
+      + 'Use a GitHub PAT classic token (ghp_*) with repo and admin:repo_hook scopes, '
+      + 'then re-run deploy.',
+    );
+  }
+}
+
 function buildConfig(target, cliRegion) {
   const { envFilePath, values } = loadDeploymentEnv(target);
   const deployEnvironment = values.DEPLOY_ENVIRONMENT || (target === 'development' ? 'staging' : target);
@@ -143,6 +199,19 @@ function buildConfig(target, cliRegion) {
   const rootDomain = values.ROOT_DOMAIN || 'findingestates.com';
   const stackName = values.STACK_NAME || `estatesnearm-${deployEnvironment}`;
   const branch = values.GITHUB_BRANCH || 'main';
+  const useExistingAmplifyApp = values.USE_EXISTING_AMPLIFY_APP === 'true';
+  const existingAmplifyAppId = values.EXISTING_AMPLIFY_APP_ID || '';
+  const existingAmplifyDefaultDomain = values.EXISTING_AMPLIFY_DEFAULT_DOMAIN || '';
+  const manageAmplifyRoute53Records = values.MANAGE_AMPLIFY_ROUTE53_RECORDS !== 'false';
+  const createApexAmplifyAlias = values.CREATE_APEX_AMPLIFY_ALIAS === 'true';
+  const createDynamoDBTables = values.CREATE_DYNAMODB_TABLES !== 'false';
+  const existingUsersTableName = values.EXISTING_USERS_TABLE_NAME || '';
+  const existingSalesTableName = values.EXISTING_SALES_TABLE_NAME || '';
+  const createAPIGatewayCustomDomain = values.CREATE_API_GATEWAY_CUSTOM_DOMAIN !== 'false';
+  const existingAPIGatewayDomainName = values.EXISTING_API_GATEWAY_DOMAIN_NAME || '';
+  const existingAPIGatewayRegionalDomainName = values.EXISTING_API_GATEWAY_REGIONAL_DOMAIN_NAME || '';
+  const existingAPIGatewayRegionalHostedZoneId = values.EXISTING_API_GATEWAY_REGIONAL_HOSTED_ZONE_ID || '';
+  const createSSMParameters = values.CREATE_SSM_PARAMETERS !== 'false';
   const lambdaCodeBucket = resolveArtifactBucket(values, deployEnvironment, region);
   const lambdaCodeKey = values.LAMBDA_CODE_S3_KEY || `backend/lambda-${deployEnvironment}.zip`;
 
@@ -155,20 +224,43 @@ function buildConfig(target, cliRegion) {
     rootDomain,
     stackName,
     branch,
+    useExistingAmplifyApp,
+    existingAmplifyAppId,
+    existingAmplifyDefaultDomain,
+    manageAmplifyRoute53Records,
+    createApexAmplifyAlias,
+    createDynamoDBTables,
+    existingUsersTableName,
+    existingSalesTableName,
+    createAPIGatewayCustomDomain,
+    existingAPIGatewayDomainName,
+    existingAPIGatewayRegionalDomainName,
+    existingAPIGatewayRegionalHostedZoneId,
+    createSSMParameters,
     lambdaCodeBucket,
     lambdaCodeKey,
   };
 
-  ensureRequired(config, [
+  const requiredKeys = [
     'JWT_SECRET',
     'ADMIN_EMAIL',
     'ROUTE53_HOSTED_ZONE_ID',
-    'GITHUB_REPO_URL',
-    'AMPLIFY_GITHUB_TOKEN',
-  ]);
+  ];
+
+  if (config.useExistingAmplifyApp) {
+    requiredKeys.push('EXISTING_AMPLIFY_APP_ID', 'EXISTING_AMPLIFY_DEFAULT_DOMAIN');
+  } else {
+    requiredKeys.push('GITHUB_REPO_URL', 'AMPLIFY_GITHUB_TOKEN');
+  }
+
+  ensureRequired(config, requiredKeys);
 
   if (config.JWT_SECRET.length < 32) {
     throw new Error('JWT_SECRET must be at least 32 characters.');
+  }
+
+  if (!config.useExistingAmplifyApp) {
+    validateAmplifyGitHubToken(config.AMPLIFY_GITHUB_TOKEN);
   }
 
   return config;
@@ -299,9 +391,22 @@ function deployCloudFormation(config) {
     `AdminEmail=${config.ADMIN_EMAIL}`,
     `RootDomain=${config.rootDomain}`,
     `Route53HostedZoneId=${config.ROUTE53_HOSTED_ZONE_ID}`,
-    `GitHubRepoUrl=${config.GITHUB_REPO_URL}`,
+    `GitHubRepoUrl=${config.GITHUB_REPO_URL || 'https://github.com/placeholder/placeholder'}`,
     `GitHubBranch=${config.branch}`,
-    `AmplifyGitHubToken=${config.AMPLIFY_GITHUB_TOKEN}`,
+    `AmplifyGitHubToken=${config.AMPLIFY_GITHUB_TOKEN || 'unused-when-reusing-amplify'}`,
+    `UseExistingAmplifyApp=${config.useExistingAmplifyApp ? 'true' : 'false'}`,
+    `ExistingAmplifyAppId=${config.existingAmplifyAppId}`,
+    `ExistingAmplifyDefaultDomain=${config.existingAmplifyDefaultDomain}`,
+    `ManageAmplifyRoute53Records=${config.manageAmplifyRoute53Records ? 'true' : 'false'}`,
+    `CreateApexAmplifyAlias=${config.createApexAmplifyAlias ? 'true' : 'false'}`,
+    `CreateDynamoDBTables=${config.createDynamoDBTables ? 'true' : 'false'}`,
+    `ExistingUsersTableName=${config.existingUsersTableName}`,
+    `ExistingSalesTableName=${config.existingSalesTableName}`,
+    `CreateAPIGatewayCustomDomain=${config.createAPIGatewayCustomDomain ? 'true' : 'false'}`,
+    `ExistingAPIGatewayDomainName=${config.existingAPIGatewayDomainName}`,
+    `ExistingAPIGatewayRegionalDomainName=${config.existingAPIGatewayRegionalDomainName}`,
+    `ExistingAPIGatewayRegionalHostedZoneId=${config.existingAPIGatewayRegionalHostedZoneId}`,
+    `CreateSSMParameters=${config.createSSMParameters ? 'true' : 'false'}`,
     '--no-fail-on-empty-changeset',
   ]);
 
@@ -405,6 +510,7 @@ function main() {
   }
 
   const config = buildConfig(targetArg, cliRegion);
+  autoSkipAmplifyDnsWhenRecordsExist(config);
 
   console.log('');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -415,6 +521,7 @@ function main() {
   console.log(`  Stack       : ${config.stackName}`);
   console.log(`  Domain      : ${config.rootDomain}`);
   console.log(`  Branch      : ${config.branch}`);
+  console.log(`  Manage DNS  : ${config.manageAmplifyRoute53Records ? 'yes' : 'no (apex/www skipped)'}`);
   console.log(`  Env file    : ${path.basename(config.envFilePath)}`);
   console.log(`  Lambda ZIP  : s3://${config.lambdaCodeBucket}/${config.lambdaCodeKey}`);
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');

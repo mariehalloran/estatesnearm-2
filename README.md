@@ -164,7 +164,7 @@ Refresh  → Cognito REFRESH_TOKEN_AUTH → New IdToken issued
 ### Prerequisites
 - AWS CLI configured with admin permissions
 - Route 53 hosted zone for `findingestates.com`
-- GitHub Personal Access Token (`repo` scope) for Amplify
+- GitHub PAT classic (`ghp_*`) with `repo` and `admin:repo_hook` scopes for Amplify
 - `AdminEmail` for CloudWatch alarm notifications
 
 ### Deployment environment files
@@ -192,6 +192,27 @@ GITHUB_BRANCH=main
 AMPLIFY_GITHUB_TOKEN=ghp_replace_me
 REACT_APP_GOOGLE_MAPS_API_KEY=your_maps_key
 ```
+
+Optional (reuse existing Amplify app and skip creating Amplify resources):
+
+```env
+USE_EXISTING_AMPLIFY_APP=true
+EXISTING_AMPLIFY_APP_ID=d123example
+EXISTING_AMPLIFY_DEFAULT_DOMAIN=main.d123example.amplifyapp.com
+```
+
+When `USE_EXISTING_AMPLIFY_APP=true`, deployment skips creating/updating Amplify app/branch/domain and Route 53 apex/www records managed by Amplify in this stack.
+
+Optional (keep creating Amplify resources, but skip Route 53 apex/www records if they already exist):
+
+```env
+MANAGE_AMPLIFY_ROUTE53_RECORDS=false
+```
+
+Use this when you get Route 53 errors like "record already exists" for `www` or apex.
+The deploy script also auto-detects existing apex/www records and disables Amplify DNS record creation for that run.
+
+Note: apex ALIAS creation to an Amplify default domain is disabled by default in CloudFormation to avoid alias target zone validation errors. Keep apex DNS managed manually (or by existing records) unless you explicitly enable template parameter `CreateApexAmplifyAlias=true`.
 
 If `LAMBDA_CODE_S3_BUCKET` is blank or left as `your-artifacts-bucket`, the deploy command auto-creates a private artifact bucket in your AWS account and uses that instead.
 
@@ -373,9 +394,11 @@ Before running `npm run deploy:production` you need:
    - Open [Route 53 console](https://console.aws.amazon.com/route53/v2/hostedzones)
    - Click on `findingestates.com` — the Zone ID is in the top-right panel (e.g. `Z1D633PJN98FT9`)
 
-2. **GitHub Personal Access Token** with `repo` scope
+2. **GitHub PAT classic** (`ghp_*`) with `repo` and `admin:repo_hook` scopes
    - Create at https://github.com/settings/tokens
-   - Amplify uses it to pull your source code on each build
+   - Fine-grained tokens (`github_pat_*`) may fail with webhook 403 errors during Amplify app setup
+   - If your repo is in an org with SSO, authorize the token for that org
+   - Amplify uses it to pull your source code and manage repository webhooks
 
 ### Deploy
 

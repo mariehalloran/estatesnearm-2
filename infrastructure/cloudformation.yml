@@ -69,15 +69,109 @@ Parameters:
     Type: String
     NoEcho: true
     Description: >
-      GitHub Personal Access Token (classic) with repo scope.
+      GitHub Personal Access Token (classic) with repo and admin:repo_hook scopes.
       Amplify uses this to pull your repo. Create at:
       https://github.com/settings/tokens
+
+  UseExistingAmplifyApp:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to true to skip creating Amplify resources in this stack and reuse an
+      existing Amplify app.
+
+  ExistingAmplifyAppId:
+    Type: String
+    Default: ''
+    Description: Existing Amplify App ID to use when UseExistingAmplifyApp=true
+
+  ExistingAmplifyDefaultDomain:
+    Type: String
+    Default: ''
+    Description: Existing Amplify default domain when UseExistingAmplifyApp=true
+
+  ManageAmplifyRoute53Records:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to false to skip creating Route 53 apex/www records for Amplify.
+      Useful when those records already exist and are managed outside this stack.
+
+  CreateApexAmplifyAlias:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Create a Route 53 apex ALIAS to Amplify default domain. Disabled by default
+      because Amplify default domains may not be valid ALIAS targets for zone
+      x in all accounts.
+
+  CreateDynamoDBTables:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to false to skip creating DynamoDB tables. Use when tables already exist
+      (e.g. enm-users-staging, enm-sales-staging) and are managed outside this stack.
+
+  ExistingUsersTableName:
+    Type: String
+    Default: ''
+    Description: Existing Users table name when CreateDynamoDBTables=false
+
+  ExistingSalesTableName:
+    Type: String
+    Default: ''
+    Description: Existing Sales table name when CreateDynamoDBTables=false
+
+  CreateAPIGatewayCustomDomain:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to false to skip creating API Gateway custom domain. Use when
+      api.findingestates.com domain already exists and is managed outside this stack.
+
+  ExistingAPIGatewayDomainName:
+    Type: String
+    Default: ''
+    Description: Existing API Gateway domain name when CreateAPIGatewayCustomDomain=false
+
+  ExistingAPIGatewayRegionalDomainName:
+    Type: String
+    Default: ''
+    Description: Existing API Gateway regional domain name when CreateAPIGatewayCustomDomain=false
+
+  ExistingAPIGatewayRegionalHostedZoneId:
+    Type: String
+    Default: ''
+    Description: Existing API Gateway regional hosted zone ID when CreateAPIGatewayCustomDomain=false
+
+  CreateSSMParameters:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to false to skip creating SSM parameters. Use when parameters
+      already exist (e.g. /enm/jwt-secret, /enm/google-maps-api-key).
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONDITIONS
 # ─────────────────────────────────────────────────────────────────────────────
 Conditions:
   IsProduction: !Equals [!Ref Environment, production]
+  CreateAmplifyResources: !Equals [!Ref UseExistingAmplifyApp, 'false']
+  CreateAmplifyDnsRecords: !And
+    - !Condition CreateAmplifyResources
+    - !Equals [!Ref ManageAmplifyRoute53Records, 'true']
+  CreateAmplifyApexAliasRecord: !And
+    - !Condition CreateAmplifyDnsRecords
+    - !Equals [!Ref CreateApexAmplifyAlias, 'true']
+  CreateDynamoDBTablesCondition: !Equals [!Ref CreateDynamoDBTables, 'true']
+  CreateAPIGatewayCustomDomainCondition: !Equals [!Ref CreateAPIGatewayCustomDomain, 'true']
+  CreateSSMParametersCondition: !Equals [!Ref CreateSSMParameters, 'true']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESOURCES
@@ -114,6 +208,7 @@ Resources:
   ##############################################################################
   UsersTable:
     Type: AWS::DynamoDB::Table
+    Condition: CreateDynamoDBTablesCondition
     DeletionPolicy: Retain
     Properties:
       TableName: !Sub 'enm-users-${Environment}'
@@ -141,6 +236,7 @@ Resources:
 
   SalesTable:
     Type: AWS::DynamoDB::Table
+    Condition: CreateDynamoDBTablesCondition
     DeletionPolicy: Retain
     Properties:
       TableName: !Sub 'enm-sales-${Environment}'
@@ -348,10 +444,10 @@ Resources:
                   - dynamodb:BatchGetItem
                   - dynamodb:BatchWriteItem
                 Resource:
-                  - !GetAtt UsersTable.Arn
-                  - !GetAtt SalesTable.Arn
-                  - !Sub '${UsersTable.Arn}/index/*'
-                  - !Sub '${SalesTable.Arn}/index/*'
+                  - !If [CreateDynamoDBTablesCondition, !GetAtt UsersTable.Arn, !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ExistingUsersTableName}']
+                  - !If [CreateDynamoDBTablesCondition, !GetAtt SalesTable.Arn, !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ExistingSalesTableName}']
+                  - !If [CreateDynamoDBTablesCondition, !Sub '${UsersTable.Arn}/index/*', !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ExistingUsersTableName}/index/*']
+                  - !If [CreateDynamoDBTablesCondition, !Sub '${SalesTable.Arn}/index/*', !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ExistingSalesTableName}/index/*']
         - PolicyName: S3UploadsAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -379,7 +475,7 @@ Resources:
 
   BackendLambdaFunction:
     Type: AWS::Lambda::Function
-    DependsOn: [UsersTable, SalesTable, CognitoUserPool]
+    DependsOn: [CognitoUserPool]
     Properties:
       FunctionName: !Sub 'enm-api-${Environment}'
       Runtime: nodejs20.x
@@ -394,8 +490,8 @@ Resources:
       Environment:
         Variables:
           NODE_ENV: production
-          DYNAMODB_USERS_TABLE: !Ref UsersTable
-          DYNAMODB_SALES_TABLE: !Ref SalesTable
+          DYNAMODB_USERS_TABLE: !If [CreateDynamoDBTablesCondition, !Ref UsersTable, !Ref ExistingUsersTableName]
+          DYNAMODB_SALES_TABLE: !If [CreateDynamoDBTablesCondition, !Ref SalesTable, !Ref ExistingSalesTableName]
           COGNITO_USER_POOL_ID: !Ref CognitoUserPool
           COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
           S3_BUCKET_NAME: !Ref UploadsBucket
@@ -533,6 +629,7 @@ Resources:
   # Custom domain for API Gateway → api.findingestates.com
   APIGatewayCustomDomain:
     Type: AWS::ApiGatewayV2::DomainName
+    Condition: CreateAPIGatewayCustomDomainCondition
     DependsOn: Certificate
     Properties:
       DomainName: !Sub 'api.${RootDomain}'
@@ -543,6 +640,7 @@ Resources:
 
   APIGatewayDomainMapping:
     Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: CreateAPIGatewayCustomDomainCondition
     DependsOn: [APIGatewayStage, APIGatewayCustomDomain]
     Properties:
       ApiId: !Ref APIGateway
@@ -560,6 +658,7 @@ Resources:
   # IAM role Amplify uses to access SSM / build
   AmplifyServiceRole:
     Type: AWS::IAM::Role
+    Condition: CreateAmplifyResources
     Properties:
       RoleName: !Sub 'enm-amplify-role-${Environment}'
       AssumeRolePolicyDocument:
@@ -582,7 +681,8 @@ Resources:
 
   AmplifyApp:
     Type: AWS::Amplify::App
-    DependsOn: [CognitoUserPool, CognitoUserPoolClient, APIGatewayCustomDomain]
+    Condition: CreateAmplifyResources
+    DependsOn: [CognitoUserPool, CognitoUserPoolClient]
     Properties:
       Name: !Sub 'estatesnearm-${Environment}'
       Repository: !Ref GitHubRepoUrl
@@ -644,6 +744,7 @@ Resources:
   # Connect the main branch to Amplify
   AmplifyBranch:
     Type: AWS::Amplify::Branch
+    Condition: CreateAmplifyResources
     Properties:
       AppId: !GetAtt AmplifyApp.AppId
       BranchName: !Ref GitHubBranch
@@ -665,6 +766,7 @@ Resources:
   # Associate findingestates.com + www with the Amplify app
   AmplifyDomain:
     Type: AWS::Amplify::Domain
+    Condition: CreateAmplifyResources
     DependsOn: [AmplifyBranch, Certificate]
     Properties:
       AppId: !GetAtt AmplifyApp.AppId
@@ -686,6 +788,7 @@ Resources:
   # Amplify provides a DNS target we point to via CNAME (root uses ALIAS)
   DNSRecordApex:
     Type: AWS::Route53::RecordSet
+    Condition: CreateAmplifyApexAliasRecord
     DependsOn: AmplifyDomain
     Properties:
       HostedZoneId: !Ref Route53HostedZoneId
@@ -700,6 +803,7 @@ Resources:
   # www.findingestates.com → Amplify
   DNSRecordWWW:
     Type: AWS::Route53::RecordSet
+    Condition: CreateAmplifyDnsRecords
     DependsOn: AmplifyDomain
     Properties:
       HostedZoneId: !Ref Route53HostedZoneId
@@ -712,6 +816,7 @@ Resources:
   # api.findingestates.com → API Gateway custom domain
   DNSRecordAPI:
     Type: AWS::Route53::RecordSet
+    Condition: CreateAPIGatewayCustomDomainCondition
     DependsOn: APIGatewayCustomDomain
     Properties:
       HostedZoneId: !Ref Route53HostedZoneId
@@ -727,6 +832,7 @@ Resources:
   ##############################################################################
   SSMJwtSecret:
     Type: AWS::SSM::Parameter
+    Condition: CreateSSMParametersCondition
     Properties:
       Name: /enm/jwt-secret
       Type: String
@@ -736,6 +842,7 @@ Resources:
 
   SSMGoogleMapsKey:
     Type: AWS::SSM::Parameter
+    Condition: CreateSSMParametersCondition
     Properties:
       Name: /enm/google-maps-api-key
       Type: String
@@ -806,12 +913,12 @@ Outputs:
 
   AmplifyAppId:
     Description: Amplify App ID (needed for manual deploys / branch triggers)
-    Value: !GetAtt AmplifyApp.AppId
+    Value: !If [CreateAmplifyResources, !GetAtt AmplifyApp.AppId, !Ref ExistingAmplifyAppId]
     Export: {Name: !Sub 'enm-amplify-app-id-${Environment}'}
 
   AmplifyDefaultDomain:
     Description: Amplify-generated domain (before DNS propagation)
-    Value: !GetAtt AmplifyApp.DefaultDomain
+    Value: !If [CreateAmplifyResources, !GetAtt AmplifyApp.DefaultDomain, !Ref ExistingAmplifyDefaultDomain]
 
   CognitoUserPoolId:
     Description: Cognito User Pool ID
@@ -829,11 +936,11 @@ Outputs:
 
   UsersTableName:
     Description: DynamoDB Users table
-    Value: !Ref UsersTable
+    Value: !If [CreateDynamoDBTablesCondition, !Ref UsersTable, !Ref ExistingUsersTableName]
 
   SalesTableName:
     Description: DynamoDB Sales table
-    Value: !Ref SalesTable
+    Value: !If [CreateDynamoDBTablesCondition, !Ref SalesTable, !Ref ExistingSalesTableName]
 
   UploadsBucketName:
     Description: S3 bucket for image uploads
